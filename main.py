@@ -21,17 +21,19 @@ PORT = int(os.getenv("PORT", "8300"))
 ENABLE_NGROK = os.getenv("ENABLE_NGROK", "").lower() in ("1", "true", "yes", "on")
 TYPHOON_API_KEY = os.getenv("TYPHOON_API_KEY", "sk-isgEKmDdHNQGhjq0R7GVTKAUoOSRr0qOAwoJObIXs5w5CBNL")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "c0186a5f58d5dcf0f0528503bd34777f4f70fc36093d03def2738a94534cd775")
-
-app = FastAPI(title="Document Comparison API")
-
-origins = [
+MODEL = os.getenv("TOGETHER_MODEL", "google/gemma-3n-E4B-it")
+DEFAULT_ORIGINS = [
     "http://127.0.0.1:8000",
     "http://localhost:8000",
 ]
+ENV_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+ORIGINS = [o.strip() for o in ENV_ORIGINS.split(",") if o.strip()] or DEFAULT_ORIGINS
+
+app = FastAPI(title="Document Comparison API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -694,7 +696,7 @@ def create_comparison_prompt(text1: str, text2: str) -> str:
     return prompt
 
 def compare_with_together(text1: str, text2: str, api_key: str, 
-                         model: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo") -> dict:
+                         model: str = MODEL) -> dict:
     """
     ส่งข้อความไปให้ Together AI เปรียบเทียบ
     

@@ -1,2 +1,10 @@
 fastapi==0.100.0
 hypercorn==0.14.4
+pymupdf 
+requests 
+pandas 
+together 
+nest-asyncio 
+uvicorn 
+pyngrok 
+python-multipart

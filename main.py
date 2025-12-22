@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pyngrok import ngrok
 from together import Together
+from bs4 import BeautifulSoup
 
 HOST = os.getenv("APP_HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8300"))
@@ -49,6 +50,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "/compare-documents": "POST - เปรียบเทียบเอกสาร 2 ฉบับ",
+            "/compare-deep-scan": "POST - เปรียบเทียบแบบละเอียด (LLM Search Line-by-Line)",
         }
     }
 
@@ -701,6 +703,178 @@ def create_comparison_prompt(text1: str, text2: str) -> str:
 """
     return prompt
 
+
+def clean_html_preserve_lines(text: str) -> list:
+    """
+    Clean HTML text but preserve lines/sentences.
+    """
+    if not text: return []
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
+    text = re.sub(r'</div>', '\n', text, flags=re.I)
+    text = re.sub(r'</p>', '\n', text, flags=re.I)
+    soup = BeautifulSoup(text, 'html.parser')
+    text_content = soup.get_text(separator=' ')
+    lines = [line.strip() for line in text_content.split('\n') if line.strip()]
+    return lines
+
+
+def llm_find_best_match(query_sentence: str, full_text_doc2: str, source_page: int = 1, model: str = 'meta-llama/Llama-3.3-70B-Instruct-Turbo') -> dict:
+    """
+    ค้นหาข้อความจาก Doc 1 ใน Doc 2 - prompt ง่ายๆ เพื่อให้ consistent
+    """
+    client = Together(api_key=TOGETHER_API_KEY)
+    
+    prompt = f"""คุณคือระบบค้นหาข้อความ ทำหน้าที่ค้นหาข้อความเป้าหมายใน Doc 2
+
+ข้อความเป้าหมาย (จาก Doc 1 หน้า {source_page}):
+"{query_sentence}"
+
+เนื้อหา Doc 2 (แต่ละหน้าขึ้นต้นด้วย "=== Page X ==="):
+{full_text_doc2}
+
+คำสั่ง:
+1. ค้นหาข้อความใน Doc 2 ที่ตรงกับเป้าหมาย หรือ มีความหมายเดียวกัน
+2. ถ้าเจอ: ระบุข้อความที่เจอ + หน้าที่เจอ + บอกว่าเหมือนหรือต่างอย่างไร
+3. ถ้าไม่เจอ: ตอบ NOT_FOUND
+
+ตอบ JSON:
+{{
+    "status": "FOUND" หรือ "NOT_FOUND",
+    "found_text": "ข้อความที่เจอ (null ถ้าไม่เจอ)",
+    "found_page": หมายเลขหน้า (null ถ้าไม่เจอ),
+    "is_same": true ถ้าเหมือนกันทุกประการ / false ถ้าต่างกัน,
+    "difference": "อธิบายสั้นๆ ว่าต่างกันอย่างไร (null ถ้าเหมือนกัน)"
+}}"""
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        if "```json" in content: content = content.replace("```json", "").replace("```", "")
+        result = json.loads(content)
+        
+        # แปลง format ให้เข้ากับระบบเดิม
+        status = result.get('status', 'NOT_FOUND')
+        found_page = result.get('found_page')
+        is_same = result.get('is_same', False)
+        
+        # กำหนด status ตาม logic
+        if status == 'FOUND':
+            if is_same:
+                if found_page == source_page:
+                    final_status = 'FOUND_SAME_PAGE'
+                else:
+                    final_status = 'FOUND_DIFFERENT_PAGE'  # relocated
+            else:
+                final_status = 'FOUND_MODIFIED'
+        else:
+            final_status = 'NOT_FOUND'
+        
+        return {
+            "status": final_status,
+            "found_text": result.get('found_text'),
+            "found_page": found_page,
+            "is_semantic_equivalent": is_same,
+            "difference": result.get('difference'),
+            "severity": None,  # จะกำหนดทีหลังถ้าต้องการ
+            "reason": result.get('difference') or ('เหมือนกัน' if is_same else 'ไม่เจอ')
+        }
+    except Exception as e:
+        return {
+            "status": "ERROR",
+            "found_text": None, 
+            "found_page": None, 
+            "is_semantic_equivalent": None,
+            "difference": None,
+            "severity": None,
+            "reason": str(e)
+        }
+
+
+def compare_using_full_llm_search(raw_text1: str, raw_text2: str) -> list:
+    """
+    เปรียบเทียบแบบ Cross-Page: ดูว่าประโยคจากหน้าใดใน Doc 1 ไปปรากฏที่หน้าใดใน Doc 2
+    """
+    
+    # 1. Parse Doc 1 ตามหน้า (เก็บหมายเลขหน้าต้นทาง)
+    doc1_lines_with_pages = []
+    current_page = 1
+    
+    # แยกตามหน้าก่อน
+    page_pattern = re.compile(r'=== Page (\d+) ===')
+    
+    for line in raw_text1.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+            
+        # เช็คว่าเป็น page tag หรือเปล่า
+        page_match = page_pattern.match(line)
+        if page_match:
+            current_page = int(page_match.group(1))
+            continue
+        
+        # Clean HTML ออกจากบรรทัดนี้
+        cleaned_lines = clean_html_preserve_lines(line)
+        for cleaned in cleaned_lines:
+            if len(cleaned) >= 4:  # ข้ามคำสั้นๆ
+                doc1_lines_with_pages.append({
+                    "text": cleaned,
+                    "page": current_page
+                })
+    
+    # 2. Doc 2 ส่งไปทั้งก้อน **พร้อม tag หน้า** เพื่อให้ LLM ระบุหน้าได้
+    # Clean เฉพาะ HTML แต่เก็บ page tags ไว้
+    doc2_lines = []
+    current_page_doc2 = 1
+    for line in raw_text2.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        
+        page_match = page_pattern.match(line)
+        if page_match:
+            current_page_doc2 = int(page_match.group(1))
+            doc2_lines.append(f"\n=== Page {current_page_doc2} ===")
+            continue
+        
+        # Clean HTML แต่เก็บข้อความ
+        cleaned = clean_html_preserve_lines(line)
+        doc2_lines.extend(cleaned)
+    
+    doc2_full_text = "\n".join(doc2_lines)
+    
+    results = []
+    
+    print(f"🚀 กำลังใช้ AI สแกนหาคู่สำหรับ {len(doc1_lines_with_pages)} ประโยค (Cross-Page Detection)...")
+    
+    for i, item in enumerate(doc1_lines_with_pages):
+        line1 = item["text"]
+        page1 = item["page"]
+        
+        # เรียก LLM (ทีละบรรทัด) พร้อมส่ง source_page ไปด้วย
+        print(f"[{i+1}/{len(doc1_lines_with_pages)}] (หน้า {page1}) กำลังหา: {line1[:30]}...") 
+        match_result = llm_find_best_match(line1, doc2_full_text, source_page=page1)
+        
+        results.append({
+            "doc1": line1,
+            "doc1_page": page1,
+            "status": match_result.get('status', 'NOT_FOUND'),
+            "doc2": match_result.get('found_text'),
+            "doc2_page": match_result.get('found_page'),
+            "is_semantic_equivalent": match_result.get('is_semantic_equivalent'),
+            "difference": match_result.get('difference'),
+            "severity": match_result.get('severity'),
+            "reason": match_result.get('reason', '-')
+        })
+        
+    return results
+
+
 def compare_with_together(text1: str, text2: str, api_key: str, 
                          model: str = MODEL) -> dict:
     """
@@ -996,6 +1170,146 @@ async def compare_documents(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาด: {str(e)}")
     
+
+@app.post("/compare-deep-scan")
+async def compare_documents_deep_scan(
+    document1: UploadFile = File(..., description="เอกสารฉบับที่ 1"),
+    document2: UploadFile = File(..., description="เอกสารฉบับที่ 2"),
+    include_matched: bool = False  # ถ้า True จะ return ทุกรายการรวมที่เหมือนกัน
+):
+    if not document1.filename.endswith('.pdf') or not document2.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="กรุณาอัพโหลดไฟล์ PDF เท่านั้น")
+        
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        
+        pdf1_path = temp_path / "document1.pdf"
+        pdf2_path = temp_path / "document2.pdf"
+
+        with open(pdf1_path, "wb") as f:
+            f.write(await document1.read())
+            
+        with open(pdf2_path, "wb") as f:
+            f.write(await document2.read())
+            
+        try:
+            # สร้างโฟลเดอร์สำหรับรูปภาพ
+            img_dir1 = temp_path / "images1"
+            img_dir2 = temp_path / "images2"
+            
+            img_dir1.mkdir(parents=True, exist_ok=True)
+            img_dir2.mkdir(parents=True, exist_ok=True)
+             
+            print("\n[Deep Scan] แปลง PDF 1 เป็นรูปภาพ...")
+            images1 = pdf_to_images(pdf1_path, img_dir1)
+            
+            print("\n[Deep Scan] แปลง PDF 2 เป็นรูปภาพ...")
+            images2 = pdf_to_images(pdf2_path, img_dir2)
+
+            print("\n[Deep Scan] ทำ OCR กับ PDF 1...")
+            texts1 = []
+            for img in images1:
+                text = ocr_image_typhoon(img, TYPHOON_API_KEY)
+                texts1.append(text or "")
+            
+            print("\n[Deep Scan] ทำ OCR กับ PDF 2...")
+            texts2 = []
+            for img in images2:
+                text = ocr_image_typhoon(img, TYPHOON_API_KEY)
+                texts2.append(text or "")
+            
+            # รวม Text ทั้งหมด
+            all_text1 = build_combined_pages(texts1)
+            all_text2 = build_combined_pages(texts2)
+            
+            print(f"\n[Deep Scan] เริ่มการค้นหา Line-by-Line ด้วย LLM...")
+            
+            # เรียกใช้ฟังก์ชันใหม่ที่เพิ่งเพิ่มเข้าไป
+            scan_results = compare_using_full_llm_search(all_text1, all_text2)
+            
+            # แปลง scan_results เป็น format เดียวกับ compare-documents
+            changes_list = []
+            matched_list = []  # เก็บรายการที่เหมือนกัน
+            
+            # สถิติ
+            stats = {
+                "total_scanned": len(scan_results),
+                "matched_same_page": 0,
+                "relocated": 0,
+                "modified": 0,
+                "removed": 0,
+                "error": 0
+            }
+            
+            for result in scan_results:
+                status = result.get('status', 'NOT_FOUND')
+                
+                # กำหนด change_type จาก status
+                if status == 'NOT_FOUND':
+                    change_type = 'removed'
+                    stats["removed"] += 1
+                elif status == 'FOUND_MODIFIED':
+                    change_type = 'modified'
+                    stats["modified"] += 1
+                elif status == 'FOUND_DIFFERENT_PAGE':
+                    change_type = 'relocated'
+                    stats["relocated"] += 1
+                elif status == 'FOUND_SAME_PAGE':
+                    stats["matched_same_page"] += 1
+                    if result.get('is_semantic_equivalent', True):
+                        # เก็บไว้ใน matched_list
+                        if include_matched:
+                            matched_list.append({
+                                "field_name": result.get('doc1', '')[:50],
+                                "field_type": "other",
+                                "old_value": result.get('doc1'),
+                                "new_value": result.get('doc2'),
+                                "doc1_page": result.get('doc1_page'),
+                                "doc2_page": result.get('doc2_page'),
+                                "change_type": "matched",
+                                "severity": None,
+                                "description": "เหมือนกัน",
+                                "difference": None,
+                                "is_semantic_equivalent": True
+                            })
+                        continue  # ไม่ใส่ใน changes_list
+                    change_type = 'modified'
+                    stats["modified"] += 1
+                elif status == 'ERROR':
+                    change_type = 'error'
+                    stats["error"] += 1
+                else:
+                    change_type = 'unknown'
+                
+                change_item = {
+                    "field_name": result.get('doc1', '')[:50],
+                    "field_type": "other",
+                    "old_value": result.get('doc1'),
+                    "new_value": result.get('doc2'),
+                    "doc1_page": result.get('doc1_page'),
+                    "doc2_page": result.get('doc2_page'),
+                    "change_type": change_type,
+                    "severity": result.get('severity') or 'LOW',
+                    "description": result.get('reason', '-'),
+                    "difference": result.get('difference'),
+                    "is_semantic_equivalent": result.get('is_semantic_equivalent', False)
+                }
+                changes_list.append(change_item)
+            
+            # รวม matched ถ้า include_matched = True
+            all_data = changes_list + matched_list if include_matched else changes_list
+            
+            return JSONResponse(content={
+                "data": all_data,
+                "summary": stats,
+                "document1_raw": all_text1,
+                "document2_raw": all_text2,
+            })
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาด: {str(e)}")
+
+
 def start_ngrok_if_enabled(port: int) -> Optional[str]:
     """Start ngrok tunnel only when explicitly enabled via env."""
     if not ENABLE_NGROK:

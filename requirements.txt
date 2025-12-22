@@ -8,3 +8,4 @@ nest-asyncio
 uvicorn 
 pyngrok 
 python-multipart
+beautifulsoup4
